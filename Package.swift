@@ -6,7 +6,8 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [.executable(name: "ClipHistory", targets: ["ClipHistory"])],
     targets: [
-        .executableTarget(name: "ClipHistory")
+        .executableTarget(name: "ClipHistory"),
+        .testTarget(name: "ClipHistoryTests", dependencies: ["ClipHistory"])
     ],
-    swiftLanguageModes: [.v5]
+    swiftLanguageModes: [.v6]
 )

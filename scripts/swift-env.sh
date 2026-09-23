@@ -8,9 +8,10 @@ swift_compiler_flags=()
 # beside the Swift 6 library. Prefer the matching public interface in that case.
 manifest="$(xcode-select -p)/usr/lib/swift/pm/ManifestAPI"
 interfaces="$manifest/PackageDescription.swiftmodule"
-if [[ -f "$interfaces/arm64-apple-macos.private.swiftinterface" ]] &&
-   grep -q 'swiftLanguageModes:' "$interfaces/arm64-apple-macos.swiftinterface" &&
-   ! grep -q 'swiftLanguageModes:' "$interfaces/arm64-apple-macos.private.swiftinterface"; then
+toolchain_arch="$(uname -m)"
+if [[ -f "$interfaces/$toolchain_arch-apple-macos.private.swiftinterface" ]] &&
+   grep -q 'swiftLanguageModes:' "$interfaces/$toolchain_arch-apple-macos.swiftinterface" &&
+   ! grep -q 'swiftLanguageModes:' "$interfaces/$toolchain_arch-apple-macos.private.swiftinterface"; then
     export SWIFTPM_CUSTOM_LIBS_DIR="$PWD/.build/toolchain"
     mkdir -p "$SWIFTPM_CUSTOM_LIBS_DIR/ManifestAPI/PackageDescription.swiftmodule"
     cp "$interfaces/"*-apple-macos.swiftinterface "$SWIFTPM_CUSTOM_LIBS_DIR/ManifestAPI/PackageDescription.swiftmodule/"

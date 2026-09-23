@@ -1,7 +1,9 @@
 import AppKit
+@preconcurrency import ApplicationServices
 import SwiftUI
 import ServiceManagement
 
+@MainActor
 final class ClipboardModel: ObservableObject {
     @Published private(set) var history = History()
     @Published var error: String?
@@ -9,13 +11,18 @@ final class ClipboardModel: ObservableObject {
     @Published var needsClipboardAccess = false
     @Published var accessibilityEnabled = AXIsProcessTrusted()
     @Published var paused = false { didSet { lastChange = pasteboard.changeCount } }
-    @Published var hours: Double { didSet { UserDefaults.standard.set(hours, forKey: "retentionHours"); purge() } }
-    @Published var limit: Int { didSet { UserDefaults.standard.set(limit, forKey: "historyLimit"); purge() } }
+    @Published private(set) var hours: Double
+    @Published private(set) var limit: Int
     @Published var directPaste: Bool { didSet { UserDefaults.standard.set(directPaste, forKey: "directPaste") } }
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var shortcut: Shortcut
     var onShortcutChange: ((Shortcut) -> Bool)?
-    private var vault: Vault?
+    private let storage: HistoryStorage
+    private var storageReady = false
+    private var loadTask: Task<Void, Never>?
+    private var saveTask: Task<Void, Never>?
+    private var dirty = false
+    private var revision = 0
     private var timer: Timer?
     private var lastChange: Int
     private var lastPurge = Date.distantPast
@@ -23,10 +30,11 @@ final class ClipboardModel: ObservableObject {
     private let pasteboard: NSPasteboard
     let demo: Bool
 
-    init(demo: Bool = false) {
+    init(demo: Bool = false, storage: HistoryStorage = HistoryStorage(), pasteboard: NSPasteboard? = nil) {
         self.demo = demo
-        pasteboard = demo ? .withUniqueName() : .general
-        lastChange = pasteboard.changeCount
+        self.storage = storage
+        self.pasteboard = pasteboard ?? (demo ? .withUniqueName() : .general)
+        lastChange = self.pasteboard.changeCount
         let defaults = UserDefaults.standard
         let savedHours = defaults.double(forKey: "retentionHours")
         hours = savedHours.isFinite && (1...8_760).contains(savedHours) ? savedHours : 24
@@ -34,42 +42,76 @@ final class ClipboardModel: ObservableObject {
         limit = (1...500).contains(savedLimit) ? savedLimit : 200
         directPaste = defaults.object(forKey: "directPaste") as? Bool ?? true
         shortcut = defaults.data(forKey: "shortcut").flatMap { try? JSONDecoder().decode(Shortcut.self, from: $0) } ?? .default
+        if !shortcut.isSafe { shortcut = .default }
         if demo {
             for (text, source) in [("A little less friction. A little more flow.", "Notes"), ("https://developer.apple.com/swift/", "Safari"), ("Meeting notes\n• Ship the simple version\n• Keep everything on this Mac", "Notes")] {
-                pasteboard.clearContents()
-                pasteboard.setString(text, forType: .string)
-                if let clip = Clip.capture(from: pasteboard, source: source) { history.insert(clip, hours: hours, limit: limit) }
+                self.pasteboard.clearContents()
+                self.pasteboard.setString(text, forType: .string)
+                if let clip = Clip.capture(from: self.pasteboard, source: source) { history.insert(clip, hours: hours, limit: limit) }
             }
             return
         }
         retryStorage()
         updateClipboardAccess()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in self?.poll() }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.poll() }
+        }
         timer?.tolerance = 0.15
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(wokeUp), name: NSWorkspace.didWakeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(wokeUp), name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
     }
 
     deinit {
-        timer?.invalidate()
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
-        if demo { pasteboard.releaseGlobally() }
+        // Owned and released by the main-actor app delegate (or main-actor checks).
+        MainActor.assumeIsolated {
+            timer?.invalidate()
+            NSWorkspace.shared.notificationCenter.removeObserver(self)
+            if demo { pasteboard.releaseGlobally() }
+        }
     }
 
     func retryStorage() {
-        if vault != nil { save(); return }
-        do {
-            let opened = try Vault.open()
-            var loaded = try opened.load()
-            loaded.purge(hours: hours, limit: limit)
-            try opened.save(loaded)
-            vault = opened
-            history = loaded
-            saveFailed = false
-            error = nil
-        } catch { self.error = error.localizedDescription }
+        guard !demo else { return }
+        if storageReady { save(); return }
+        guard loadTask == nil else { return }
+        loadTask = Task {
+            defer { loadTask = nil }
+            do {
+                var loaded = try await storage.load()
+                let changed = loaded.purge(hours: hours, limit: limit)
+                history = loaded
+                storageReady = true
+                saveFailed = false
+                error = nil
+                lastChange = pasteboard.changeCount
+                if changed { save() }
+            } catch { self.error = error.localizedDescription }
+        }
+    }
+
+    func retentionRemovalCount(hours: Double, limit: Int) -> Int {
+        var pruned = history
+        pruned.purge(hours: hours, limit: limit)
+        return history.clips.count - pruned.clips.count
+    }
+
+    @discardableResult
+    func applyRetention(hours: Double, limit: Int, confirmRemoval: Bool = false) -> Bool {
+        let hours = hours.isFinite ? max(1, min(hours.rounded(), 8_760)) : 24
+        let limit = max(1, min(limit, 500))
+        guard confirmRemoval || retentionRemovalCount(hours: hours, limit: limit) == 0 else { return false }
+        self.hours = hours
+        self.limit = limit
+        if !demo {
+            UserDefaults.standard.set(self.hours, forKey: "retentionHours")
+            UserDefaults.standard.set(self.limit, forKey: "historyLimit")
+        }
+        purge()
+        return true
     }
 
     func setShortcut(_ value: Shortcut) {
+        guard value.isSafe else { notice = Shortcut.requirement; return }
         guard onShortcutChange?(value) == true else {
             notice = "That shortcut is in use. Try another combination."
             return
@@ -107,6 +149,7 @@ final class ClipboardModel: ObservableObject {
 
     private func updateClipboardAccess() {
         if #available(macOS 15.4, *) {
+            // On the general pasteboard, .default may prompt; never trigger that from a timer.
             let needsAccess = pasteboard.accessBehavior != .alwaysAllow
             if needsClipboardAccess != needsAccess { needsClipboardAccess = needsAccess }
         }
@@ -118,11 +161,19 @@ final class ClipboardModel: ObservableObject {
         updateClipboardAccess()
     }
 
-    @objc private func wokeUp() { purge(); poll() }
+    @objc private func wokeUp() {
+        if !storageReady || saveFailed { retryStorage() }
+        purge()
+        poll()
+    }
 
     func poll() {
-        if Date().timeIntervalSince(lastPurge) >= 30 { refreshPermissions(); purge() }
-        guard !paused, vault != nil else {
+        if Date().timeIntervalSince(lastPurge) >= 30 {
+            if !storageReady { retryStorage() }
+            refreshPermissions()
+            purge()
+        }
+        guard !paused, storageReady else {
             lastChange = pasteboard.changeCount
             return
         }
@@ -130,10 +181,15 @@ final class ClipboardModel: ObservableObject {
         guard change != lastChange else { return }
         updateClipboardAccess()
         guard !needsClipboardAccess else { lastChange = change; return }
-        let source = NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown app"
-        let clip = Clip.capture(from: pasteboard, source: source)
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        guard frontmost?.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              NSApp?.keyWindow == nil else { lastChange = change; return }
+        let source = frontmost?.localizedName ?? "Unknown app"
+        var limitNotice: String?
+        let clip = Clip.capture(from: pasteboard, source: source, onLimit: { limitNotice = $0 })
         guard pasteboard.changeCount == change else { return }
         lastChange = change
+        if let limitNotice { notice = limitNotice }
         if let clip {
             history.insert(clip, hours: hours, limit: limit)
             save()
@@ -170,14 +226,49 @@ final class ClipboardModel: ObservableObject {
     }
 
     private func save() {
-        guard !demo, let vault else { return }
-        do {
-            try vault.save(history)
-            saveFailed = false
-            error = nil
-        } catch {
-            saveFailed = true
-            self.error = "History changes could not be saved, including deletions: \(error.localizedDescription)"
+        guard !demo, storageReady else { return }
+        dirty = true
+        revision += 1
+        saveTask?.cancel()
+        saveTask = Task {
+            do {
+                try await Task.sleep(nanoseconds: 750_000_000)
+                try await storage.save(history)
+                guard !Task.isCancelled else { return }
+                dirty = false
+                saveFailed = false
+                error = nil
+            } catch is CancellationError { }
+            catch {
+                guard !Task.isCancelled else { return }
+                reportSaveFailure(error)
+            }
         }
+    }
+
+    // Also used before quitting so the debounce never loses the last change.
+    func flushStorage() async -> Bool {
+        await loadTask?.value
+        guard !demo, storageReady else { return true }
+        while dirty {
+            saveTask?.cancel()
+            await saveTask?.value
+            let savingRevision = revision
+            do {
+                try await storage.save(history)
+                if revision == savingRevision { dirty = false }
+                saveFailed = false
+                error = nil
+            } catch {
+                reportSaveFailure(error)
+                return false
+            }
+        }
+        return true
+    }
+
+    private func reportSaveFailure(_ error: Error) {
+        saveFailed = true
+        self.error = "History changes could not be saved, including deletions: \(error.localizedDescription)"
     }
 }

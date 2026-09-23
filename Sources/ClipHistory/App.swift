@@ -2,11 +2,19 @@ import AppKit
 import Carbon
 import SwiftUI
 
-struct Shortcut: Codable, Equatable {
+struct Shortcut: Codable, Equatable, Sendable {
     var keyCode: UInt32
     var modifiers: UInt32
     var key: String
     static let `default` = Shortcut(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(controlKey | optionKey), key: "V")
+    static let requirement = "Use Control or Command plus another modifier and a letter or number."
+
+    var isSafe: Bool {
+        let allowed = UInt32(controlKey | optionKey | shiftKey | cmdKey)
+        return modifiers & ~allowed == 0 && modifiers.nonzeroBitCount >= 2
+            && modifiers & UInt32(controlKey | cmdKey) != 0
+            && key.count == 1 && key.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) }
+    }
 
     var label: String {
         [(controlKey, "⌃"), (optionKey, "⌥"), (shiftKey, "⇧"), (cmdKey, "⌘")]
@@ -28,24 +36,29 @@ struct Shortcut: Codable, Equatable {
         for (flag, carbon) in [(NSEvent.ModifierFlags.command, cmdKey), (.control, controlKey), (.option, optionKey), (.shift, shiftKey)] where flags.contains(flag) {
             modifiers |= UInt32(carbon)
         }
+        guard isSafe else { return nil }
     }
 }
 
 final class GlobalShortcut {
     private var reference: EventHotKeyRef?
     private var handler: EventHandlerRef?
-    var onPress: (() -> Void)?
+    @MainActor var onPress: (() -> Void)?
 
+    @MainActor
     init() {
         var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
             guard let context else { return OSStatus(eventNotHandledErr) }
-            Unmanaged<GlobalShortcut>.fromOpaque(context).takeUnretainedValue().onPress?()
+            MainActor.assumeIsolated {
+                Unmanaged<GlobalShortcut>.fromOpaque(context).takeUnretainedValue().onPress?()
+            }
             return noErr
         }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), &handler)
     }
 
-    func register(_ shortcut: Shortcut) -> Bool {
+    @MainActor func register(_ shortcut: Shortcut) -> Bool {
+        guard shortcut.isSafe else { return false }
         var newReference: EventHotKeyRef?
         let id = EventHotKeyID(signature: 0x434C4950, id: 1)
         guard RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, id, GetApplicationEventTarget(), 0, &newReference) == noErr else { return false }
@@ -65,6 +78,7 @@ final class HistoryPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     lazy var model = ClipboardModel(demo: CommandLine.arguments.contains("--demo"))
     private let hotkey = GlobalShortcut()
@@ -72,6 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var panel: HistoryPanel!
     private var settingsWindow: NSWindow?
     private var previousApp: NSRunningApplication?
+    private var pasteTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.cliphistory.app")
@@ -140,7 +155,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         model.refreshPermissions()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard panel != nil else { return .terminateNow }
+        let wasPaused = model.paused
+        model.paused = true
+        pasteTask?.cancel()
+        Task {
+            var canQuit = await model.flushStorage()
+            if !canQuit {
+                let alert = NSAlert()
+                alert.messageText = "History changes could not be saved"
+                alert.informativeText = "Quitting now may lose recent copies or leave deleted clips on disk."
+                alert.addButton(withTitle: "Keep Running")
+                alert.addButton(withTitle: "Quit Anyway")
+                canQuit = alert.runModal() == .alertSecondButtonReturn
+            }
+            if !canQuit { model.paused = wasPaused }
+            sender.reply(toApplicationShouldTerminate: canQuit)
+        }
+        return .terminateLater
+    }
+
     private func showHistory() {
+        pasteTask?.cancel()
         if NSWorkspace.shared.frontmostApplication?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousApp = NSWorkspace.shared.frontmostApplication
         }
@@ -151,32 +188,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             panel.setFrameOrigin(NSPoint(x: frame.midX - panel.frame.width / 2, y: frame.midY - panel.frame.height / 2 + frame.height * 0.1))
         }
         panel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         NotificationCenter.default.post(name: .pickerOpened, object: nil)
     }
 
     private func dismiss() {
+        model.notice = nil
         panel.orderOut(nil)
-        previousApp?.activate(options: .activateIgnoringOtherApps)
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != previousApp?.processIdentifier {
+            previousApp?.activate(options: .activateIgnoringOtherApps)
+        }
     }
 
     func windowDidResignKey(_ notification: Notification) {
-        if (notification.object as? NSWindow) === panel { panel.orderOut(nil) }
+        if (notification.object as? NSWindow) === panel { model.notice = nil; panel.orderOut(nil) }
     }
 
     private func choose(_ clip: Clip, copyOnly: Bool) {
+        pasteTask?.cancel()
         guard model.copy(clip) else { return }
         let target = previousApp
         let shouldPaste = !copyOnly && model.directPaste && AXIsProcessTrusted() && !model.demo
         if !copyOnly && model.directPaste && !AXIsProcessTrusted() {
             model.notice = "Copied. Press ⌘V to paste, or use Enable Accessibility in the history window for instant paste."
+            return
         }
+        if shouldPaste && (target == nil || target?.isTerminated == true) {
+            model.notice = "Copied. Switch to your app and press ⌘V to paste."
+            return
+        }
+        model.notice = nil
         dismiss()
         guard shouldPaste, let target, !target.isTerminated else { return }
-        Task { @MainActor in
+        pasteTask = Task { @MainActor in
             // Wait for focus and released shortcut modifiers before sending a single ⌘V.
             for _ in 0..<20 {
-                try? await Task.sleep(nanoseconds: 50_000_000)
+                do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
                 let flags = CGEventSource.flagsState(.combinedSessionState)
                 guard NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier,
                       flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty else { continue }
@@ -189,11 +235,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 up.post(tap: .cghidEventTap)
                 return
             }
-            model.notice = "Copied. Press ⌘V to paste into your app."
+            showHistory()
+            model.notice = "Copied, but instant paste did not finish. Switch to your app and press ⌘V."
         }
     }
 
     private func showSettings() {
+        pasteTask?.cancel()
         model.refreshPermissions()
         panel.orderOut(nil)
         if settingsWindow == nil {

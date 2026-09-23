@@ -17,10 +17,12 @@ struct PickerView: View {
     @State private var query = ""
     @State private var selection: UUID?
     @State private var keyMonitor: Any?
+    @State private var clips: [Clip] = []
     @FocusState private var searchFocused: Bool
 
-    private var clips: [Clip] {
-        model.history.clips.filter { query.isEmpty || $0.preview.localizedStandardContains(query) || $0.source.localizedStandardContains(query) || $0.kind.localizedStandardContains(query) }
+    private func filterClips() {
+        clips = model.history.clips.filter { query.isEmpty || $0.preview.localizedStandardContains(query) || $0.source.localizedStandardContains(query) || $0.kind.localizedStandardContains(query) }
+        if !clips.contains(where: { $0.id == selection }) { selection = clips.first?.id }
     }
 
     var body: some View {
@@ -134,14 +136,15 @@ struct PickerView: View {
         .frame(width: 620, height: 530)
         .background(.regularMaterial)
         .tint(accent)
-        .onChange(of: query) { _ in selection = clips.first?.id }
+        .onChange(of: query) { _ in filterClips(); selection = clips.first?.id }
         .onChange(of: model.history.clips.map(\.id)) { _ in
-            if !clips.contains(where: { $0.id == selection }) { selection = clips.first?.id }
+            filterClips()
         }
         .onReceive(NotificationCenter.default.publisher(for: .pickerOpened)) { _ in
             query = ""; selection = clips.first?.id; searchFocused = true
         }
         .onAppear {
+            filterClips()
             searchFocused = true
             selection = clips.first?.id
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
@@ -162,9 +165,11 @@ struct PickerView: View {
     }
 
     private func handle(_ event: NSEvent) -> Bool {
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Let the input method finish composition before interpreting picker commands.
+        if let editor = event.window?.firstResponder as? NSTextView, editor.hasMarkedText() { return false }
+        let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
         if event.keyCode == UInt16(kVK_Escape) { dismiss(); return true }
-        if event.keyCode == UInt16(kVK_DownArrow) || event.keyCode == UInt16(kVK_UpArrow) {
+        if flags.isEmpty && (event.keyCode == UInt16(kVK_DownArrow) || event.keyCode == UInt16(kVK_UpArrow)) {
             guard !clips.isEmpty else { return true }
             let index = clips.firstIndex { $0.id == selection } ?? 0
             selection = clips[max(0, min(clips.count - 1, index + (event.keyCode == UInt16(kVK_DownArrow) ? 1 : -1)))].id
@@ -188,6 +193,7 @@ private struct ClipRow: View {
     let clip: Clip
     let index: Int
     let selected: Bool
+    @State private var thumbnail: NSImage?
 
     var body: some View {
         HStack(spacing: 12) {
@@ -213,9 +219,10 @@ private struct ClipRow: View {
             .background(selected ? accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 9))
             .overlay(RoundedRectangle(cornerRadius: 9).stroke(selected ? accent.opacity(0.22) : .clear))
             .contentShape(Rectangle())
+            .task(id: clip.id) { thumbnail = makeThumbnail() }
     }
 
-    private var thumbnail: NSImage? {
+    private func makeThumbnail() -> NSImage? {
         guard let data = clip.imageData,
               let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
@@ -232,6 +239,10 @@ struct SettingsView: View {
     @State private var recording = false
     @State private var keyMonitor: Any?
     @State private var confirmClear = false
+    @State private var draftHours = 24.0
+    @State private var draftLimit = 200
+    @State private var confirmRetention = false
+    @State private var removalCount = 0
 
     var body: some View {
         Form {
@@ -240,9 +251,9 @@ struct SettingsView: View {
                     Text("Global shortcut")
                     Spacer()
                     Button(recording ? "Press shortcut…" : model.shortcut.label) { recording.toggle() }
-                        .help("Use Control, Option, or Command with a letter or number. Escape cancels.")
+                        .help(Shortcut.requirement + " Escape cancels.")
                 }
-                Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
+                Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
                 Toggle("Paste immediately when selecting a clip", isOn: $model.directPaste)
                 Text(model.directPaste ? "Click or press Return to paste into the previous app." : "Click or press Return to copy to the clipboard. Paste later with ⌘V.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -256,27 +267,36 @@ struct SettingsView: View {
                 }
             }
             Section("Automatic purge") {
-                Picker("Keep history for", selection: $model.hours) {
+                Picker("Keep history for", selection: $draftHours) {
                     Text("1 hour").tag(1.0)
                     Text("24 hours").tag(24.0)
                     Text("7 days").tag(168.0)
                     Text("30 days").tag(720.0)
-                    if ![1.0, 24, 168, 720].contains(model.hours) { Text("\(Int(model.hours)) hours").tag(model.hours) }
+                    if ![1.0, 24, 168, 720].contains(draftHours) { Text("\(Int(draftHours)) hours").tag(draftHours) }
                 }
                 HStack {
                     Text("Custom hours")
                     Spacer()
-                    TextField("Hours", value: $model.hours, format: .number.precision(.fractionLength(0)))
+                    TextField("Hours", value: $draftHours, format: .number.precision(.fractionLength(0)))
                         .multilineTextAlignment(.trailing).frame(width: 65)
                         .accessibilityLabel("Custom retention in hours")
-                        .onChange(of: model.hours) { value in
+                        .onChange(of: draftHours) { value in
                             let safe = value.isFinite ? max(1, min(value.rounded(), 8_760)) : 24
-                            if safe != value { model.hours = safe }
+                            if safe != value { draftHours = safe }
                         }
-                    Stepper("Retention hours", value: $model.hours, in: 1...8_760, step: 1).labelsHidden()
+                    Stepper("Retention hours", value: $draftHours, in: 1...8_760, step: 1).labelsHidden()
                 }
-                Picker("Maximum entries", selection: $model.limit) {
+                Picker("Maximum entries", selection: $draftLimit) {
                     ForEach([50, 100, 200, 500], id: \.self) { Text("\($0)").tag($0) }
+                }
+                HStack {
+                    Button("Apply retention changes") {
+                        if !model.applyRetention(hours: draftHours, limit: draftLimit) {
+                            removalCount = model.retentionRemovalCount(hours: draftHours, limit: draftLimit)
+                            confirmRetention = true
+                        }
+                    }.disabled(draftHours == model.hours && draftLimit == model.limit)
+                    Button("Reset") { draftHours = model.hours; draftLimit = model.limit }
                 }
                 Text("Expired clips are removed within 30 seconds while running, and on launch or wake. This does not clear the system clipboard.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -303,11 +323,20 @@ struct SettingsView: View {
             Button("Delete all history", role: .destructive) { model.clear() }
             Button("Cancel", role: .cancel) { }
         } message: { Text("This cannot be undone. Your current system clipboard is kept.") }
+        .confirmationDialog("Apply retention changes?", isPresented: $confirmRetention) {
+            Button("Apply and delete clips", role: .destructive) {
+                model.applyRetention(hours: draftHours, limit: draftLimit, confirmRemoval: true)
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: { Text("These settings currently remove \(removalCount) saved clips. Deletion cannot be undone.") }
         .onAppear {
+            draftHours = model.hours
+            draftLimit = model.limit
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                 guard recording, event.window?.title == "Clip History Settings" else { return event }
                 if event.keyCode == UInt16(kVK_Escape) { recording = false; return nil }
                 if let shortcut = Shortcut(event: event) { model.setShortcut(shortcut); recording = false }
+                else { model.notice = Shortcut.requirement }
                 return nil
             }
         }

@@ -9,6 +9,7 @@ Built with SwiftUI and AppKit, with no third-party dependencies.
 - Search text, images, and file references by preview or source app.
 - Paste directly into the previous app, or switch to copying back to the clipboard.
 - Configure the global shortcut, retention period, entry limit, and launch at login.
+- Apply retention edits together, with confirmation before removing saved clips.
 - Keep history locally, encrypted with AES-256-GCM and a key stored in macOS Keychain.
 - Skip clipboard items marked confidential or transient; pause capture or clear history from Settings.
 - Show fixed copy timestamps without per-entry ticking timers.
@@ -72,21 +73,27 @@ Then reopen the app and enable access. A rebuild may also require approving Keyc
 | Settings | Gear button or `⌘,` |
 | Change shortcut | Settings → Global shortcut |
 
+Global shortcuts require Control or Command plus another modifier and a letter or number. Single-modifier combinations such as `⌘C`, `⌘V`, `⌘Q`, and Option–letter are rejected; unsafe shortcuts saved by older versions fall back to `⌃⌥V`.
+
 ## Storage and automatic purge
 
 History defaults to **24 hours and 200 entries**. Settings supports retention from **1 to 8,760 hours**, up to **500 entries**, and a pause switch. Copying identical content again moves it to the top and restarts its retention period; reusing an existing entry does not.
 
-Expired entries are purged on launch, wake, opening history, changing retention settings, and every 30 seconds while running. Purging cannot happen while the app is quit or the Mac is asleep; overdue entries are removed when it resumes. Purging history does not clear the system clipboard. Fixed timestamps do not affect expiry.
+Expired entries are purged on launch, wake, opening history, applying retention settings, and every 30 seconds while running. Editing settings does not change retention until you click **Apply retention changes**; changes that remove saved clips require confirmation. Purging cannot happen while the app is quit or the Mac is asleep; overdue entries are removed when it resumes. Purging history does not clear the system clipboard. Fixed timestamps do not affect expiry.
 
-- **Formats:** text with available RTF/HTML representations, PNG/TIFF images, and file references. File contents are not archived; moved or deleted files may no longer paste. Unsupported formats are skipped.
-- **Limits:** 8 MiB per clip across its supported representations, and 32 MiB of clipboard payloads in the history.
-- **Store:** `~/Library/Application Support/ClipHistory/history.encrypted`, an atomically written encrypted snapshot. File permissions are restricted and the folder is excluded from backups.
+- **Formats:** text with available RTF/HTML representations, one image representation per item (PNG preferred, TIFF fallback), and file references. Oversized representations are skipped while smaller usable formats are retained. File contents are not archived; moved or deleted files may no longer paste. Unsupported formats are skipped.
+- **Limits:** 100 items and 8 MiB of retained representations per clip, and 32 MiB of clipboard payloads in the history. Size/count exclusions produce a notice in the picker. Multi-item copies are skipped if any item has no usable representation, to avoid restoring an incomplete selection.
+- **Store:** `~/Library/Application Support/ClipHistory/history.encrypted`, an atomically written encrypted snapshot. Encoding, encryption, and disk writes run on a serial background actor after 750 ms without a change. Quitting flushes pending changes; a save failure offers a chance to keep the app running. File permissions are restricted and the folder is excluded from backups. Snapshots now have a version; existing unversioned history still loads, and unknown versions are left untouched.
 - **Key:** a random 256-bit key in the login Keychain, service `local.cliphistory.encryption`, account `history-key`. It is device-only and is not included in app packages.
 - **Privacy:** no network code or cloud sync. macOS Universal Clipboard is a separate system feature. Confidential/transient markers are respected, but an unmarked password or secret can still be captured.
+- **Encryption boundary:** encryption protects the saved file at rest, including any copies of that file. It is not a security boundary against processes running as your logged-in user that can access the key or the app's memory.
+- **Screen sharing:** assume the picker is visible in recordings and shared screens. Apple's [`NSWindow.SharingType.none`](https://developer.apple.com/documentation/appkit/nswindow/sharingtype-swift.enum) is a legacy constant that macOS no longer uses; it does not provide a reliable privacy guarantee.
 
-Storage failures appear in the app. Unreadable history is not silently overwritten. If the key is permanently lost or the store is corrupt, intentionally deleting the encrypted store while the app is quit starts fresh; this destroys the saved history and is not a fix for a temporarily locked Keychain.
+Storage failures appear in the app. Storage retries on wake, session activation, and periodic maintenance, as well as through the Retry button. Unreadable history is not silently overwritten. If the key is permanently lost or the store is corrupt, intentionally deleting the encrypted store while the app is quit starts fresh; this destroys the saved history and is not a fix for a temporarily locked Keychain.
 
 Capture checks the pasteboard change count every 0.6 seconds and reads content only after a change. Permission checks run on activation/opening, during periodic maintenance, and before reading changed clipboard content. An unchanged purge does not trigger a history redraw.
+
+Source-app labels are best-effort: another app can become frontmost between a copy and the next poll. Copies while Clip History owns keyboard focus are skipped. Background capture still requires `alwaysAllow` on systems exposing clipboard permissions: Apple's [default behavior](https://developer.apple.com/documentation/appkit/nspasteboard/accessbehavior-swift.enum/default) can prompt, so polling must not assume it is permission. Cross-version checks on macOS 15.4 and later remain part of release testing.
 
 ## Checks and demo
 
@@ -94,7 +101,9 @@ Capture checks the pasteboard change count every 0.6 seconds and reads content o
 zsh scripts/test.sh
 ```
 
-Checks compile directly with `swiftc`; XCTest is not required. They use an isolated pasteboard and temporary encrypted files, without reading your clipboard or using your Keychain. Coverage includes capture/restore, rich text, images, multiple files, confidential markers, deduplication, expiry boundaries, size/count limits, encryption, nonce freshness, tampering, wrong keys, and avoiding UI updates during an unchanged purge. Run from a normal macOS terminal so pasteboard services are available.
+The package has a SwiftPM test target (`swift test` with a working Xcode toolchain). The script uses SwiftPM when XCTest is available and otherwise runs the same checks directly with `swiftc`, supporting Command Line Tools-only installations. Both app and checks compile in Swift 6 mode. macOS CI runs the checks and a release build.
+
+Checks use isolated pasteboards and temporary encrypted files, without reading your clipboard or using your Keychain. Coverage includes capture/restore, rich text, images, multiple files, required confidential markers, deduplication, expiry boundaries, size/count limits, encryption, nonce freshness, tampering, wrong keys, unchanged purges, lazy image formats, retention confirmation, unsafe shortcuts, legacy storage versions, deferred writes, quit flushing, and save retries. Run from a normal macOS terminal so pasteboard services are available.
 
 To preview synthetic history, quit the regular app first, then run:
 
@@ -104,7 +113,7 @@ open "dist/Clip History.app" --args --demo
 
 Demo mode does not capture or save live clipboard history, and selections restore only to its private test pasteboard.
 
-For a manual check, copy two pieces of text, open history, search, and select an entry. Verify both direct paste and copy-only mode, then check shortcut and retention preferences after relaunching. Check launch at login after moving the app to its permanent location.
+For a manual check, copy two pieces of text, open history, search, and select an entry. Verify direct paste and copy-only mode, Caps Lock with `⌘1`/`⌘Delete`, and Return/arrow keys while composing Chinese or Japanese search text. Check shortcut and retention preferences after relaunching, including canceling a destructive change. Check launch at login after moving the app to its permanent location.
 
 ## Package for sharing
 

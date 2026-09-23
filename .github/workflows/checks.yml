@@ -1,0 +1,9 @@
+name: Checks
+on: [push, pull_request]
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: zsh scripts/test.sh
+      - run: zsh scripts/build.sh
