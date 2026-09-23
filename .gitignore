@@ -1,0 +1,42 @@
+# Swift and Xcode build output
+/.build/
+/.swiftpm/
+/build/
+/dist/
+/DerivedData/
+*.app/
+*.dSYM/
+*.xcarchive/
+*.zip
+*.dmg
+*.pkg
+
+# Local editor, macOS, and agent state
+.DS_Store
+._*
+xcuserdata/
+*.xcuserstate
+/.idea/
+/.vscode/
+/.codex/
+/.agents/
+*.swp
+*.swo
+*~
+*.log
+
+# Local secrets, signing credentials, and clipboard data
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.p8
+*.p12
+*.pfx
+*.pem
+*.key
+*.keychain
+*.keychain-db
+*.mobileprovision
+*.provisionprofile
+history.encrypted
