@@ -122,8 +122,8 @@ GitHub Actions handles builds and releases. Every branch push, pull request, or 
 To publish the next version, update `CFBundleShortVersionString` and increment `CFBundleVersion`, commit and push those changes, then create and push the matching tag:
 
 ```sh
-git tag -a v1.1.3 -m "Describe the changes in this release."
-git push origin v1.1.3
+git tag -a v1.1.4 -m "Describe the changes in this release."
+git push origin v1.1.4
 ```
 
 Publishing uses GitHub's built-in workflow token; no personal access token is needed. Releases use the same ad-hoc signing as local builds, so Developer ID signing and notarization remain separate distribution work.
