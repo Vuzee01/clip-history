@@ -1,9 +1,59 @@
-name: Checks
-on: [push, pull_request]
+name: Build and release
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   macos:
     runs-on: macos-15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Verify release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: test "$GITHUB_REF_NAME" = "v$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
       - run: zsh scripts/test.sh
       - run: zsh scripts/build.sh
+      - name: Package and verify app
+        run: |
+          test "$(uname -m)" = arm64
+          codesign --verify --deep --strict "dist/Clip History.app"
+          ditto -c -k --sequesterRsrc --keepParent "dist/Clip History.app" dist/Clip-History-macOS-AppleSilicon.zip
+          cd dist
+          shasum -a 256 Clip-History-macOS-AppleSilicon.zip > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Clip-History-macOS-AppleSilicon
+          path: |
+            dist/Clip-History-macOS-AppleSilicon.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Clip-History-macOS-AppleSilicon
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" Clip-History-macOS-AppleSilicon.zip SHA256SUMS \
+            --verify-tag --notes-from-tag --title "Clip History ${GITHUB_REF_NAME#v}"

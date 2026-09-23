@@ -101,7 +101,7 @@ Source-app labels are best-effort: another app can become frontmost between a co
 zsh scripts/test.sh
 ```
 
-The package has a SwiftPM test target (`swift test` with a working Xcode toolchain). The script uses SwiftPM when XCTest is available and otherwise runs the same checks directly with `swiftc`, supporting Command Line Tools-only installations. Both app and checks compile in Swift 6 mode. macOS CI runs the checks and a release build.
+The package has a SwiftPM test target (`swift test` with a working Xcode toolchain). The script uses SwiftPM when XCTest is available and otherwise runs the same checks directly with `swiftc`, supporting Command Line Tools-only installations. Both app and checks compile in Swift 6 mode. macOS CI runs the checks, builds the app, verifies its signature, and uploads an app ZIP with a SHA-256 checksum as a workflow artifact.
 
 Checks use isolated pasteboards and temporary encrypted files, without reading your clipboard or using your Keychain. Coverage includes capture/restore, rich text, images, multiple files, required confidential markers, deduplication, expiry boundaries, size/count limits, encryption, nonce freshness, tampering, wrong keys, unchanged purges, lazy image formats, retention confirmation, unsafe shortcuts, legacy storage versions, deferred writes, quit flushing, and save retries. Run from a normal macOS terminal so pasteboard services are available.
 
@@ -117,7 +117,18 @@ For a manual check, copy two pieces of text, open history, search, and select an
 
 ## Package for sharing
 
-After building:
+GitHub Actions handles builds and releases. Every branch push, pull request, or manual **Build and release** run produces a downloadable Apple silicon app artifact, retained for 14 days. Pushing a `v*` tag also publishes the tested ZIP and `SHA256SUMS` as a GitHub release. The tag must match `CFBundleShortVersionString` in `Resources/Info.plist`; release notes come from the annotated tag.
+
+To publish the next version, update `CFBundleShortVersionString` and increment `CFBundleVersion`, commit and push those changes, then create and push the matching tag:
+
+```sh
+git tag -a v1.1.3 -m "Describe the changes in this release."
+git push origin v1.1.3
+```
+
+Publishing uses GitHub's built-in workflow token; no personal access token is needed. Releases use the same ad-hoc signing as local builds, so Developer ID signing and notarization remain separate distribution work.
+
+To package a local build manually after building:
 
 ```sh
 ditto -c -k --sequesterRsrc --keepParent "dist/Clip History.app" "dist/Clip-History-macOS.zip"
